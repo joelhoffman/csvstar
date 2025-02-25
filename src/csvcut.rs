@@ -26,7 +26,6 @@ fn parse_args(args: Vec<String>) -> CsvOptions {
     let mut matches = Command::new("CsvStar")
         .display_name(executable_name)
         .version("1.0")
-        .author("Your Name")
         .about("A description of your program")
         .arg(Arg::new("input")
                 .help("Input file to process")
@@ -54,7 +53,7 @@ fn parse_args(args: Vec<String>) -> CsvOptions {
                 .short('c')
                 .long("columns")
                 .allow_negative_numbers(true)
-                .help("List of column names, offsets or ranges to include, e.g. \"1,id,-2,3-5. Negative numbers are interpreted as offsets from the end.")
+                .help("List of column names, offsets or ranges to include, e.g. \"1,id,-2,3-5. Negative offsets are interpreted as relative to the end (-1 is the last column).")
                 .action(clap::ArgAction::Append))
         .arg(Arg::new("trim_fields").short('m').long("trimfields").help("Trim fields and headers").action(clap::ArgAction::SetTrue))
         .arg(Arg::new("delimiter").short('d').long("delimiter").help("Delimiter character"))
@@ -149,8 +148,14 @@ fn process_csv(options: &CsvOptions) -> Result<(), Box<dyn Error>> {
                         idx_vec.push((n_headers + numeric) as usize);
                     }
                 } else if let Ok(range) = parse_range(col) {
+                    if range.start >= range.end {
+                        return Err(Box::from(format!("Invalid range. Must be increasing: {}-{}", range.start, range.end)));
+                    }
+                    if range.end > headers.len() {
+                        return Err(Box::from(format!("Invalid range. There are only {} columns: {}-{}", headers.len(), range.start, range.end)));
+                    }
                     idx_vec.extend(range.clone().map(|i| i - 1));
-                } {
+                } else {
                     idx_vec.push(headers
                         .iter()
                         .position(|h| h == col)
@@ -162,35 +167,32 @@ fn process_csv(options: &CsvOptions) -> Result<(), Box<dyn Error>> {
         None => (0..headers.len()).collect(), // If no columns are specified, include all columns
     };
 
-    // Create the CSV writer
-    let output:Box<dyn io::Write>;
+    let csv_file_handle:Box<dyn io::Write>;
     if let Some(file) = &options.output_file {
-        output = Box::new(BufWriter::new(File::create(file)?));
+        csv_file_handle = Box::new(BufWriter::new(File::create(file)?));
     } else {
-        output = Box::new(io::stdout());
+        csv_file_handle = Box::new(io::stdout());
     }
 
     let output_has_headers = options.output_headers.unwrap_or(input_has_headers);
-    let mut writer = WriterBuilder::new().has_headers(output_has_headers).from_writer(output);
+    let mut csv_writer = WriterBuilder::new().has_headers(output_has_headers)
+        .from_writer(csv_file_handle);
 
-    // Write headers to the output file if required
     if output_has_headers {
-        writer.write_record(selected_indices.iter().map(|&i| &headers[i]))?;
+        csv_writer.write_record(selected_indices.iter().map(|&i| &headers[i]))?;
     }
 
-    // Process records line by line
     for result in reader.records() {
         let record = result?;
         let selected_values: Vec<&str> = selected_indices.iter().map(|&i| &record[i]).collect();
-        writer.write_record(selected_values)?;
+        csv_writer.write_record(selected_values)?;
     }
 
-    writer.flush()?;
+    csv_writer.flush()?;
 
     Ok(())
 }
 
-/// Unit tests for the functions defined above.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,47 +200,55 @@ mod tests {
 
     #[test]
     fn test_process_csv_with_valid_input() {
-        // Create mock CSV input file
-        let input_data = "col1,col2,col3\n1,2,3\n4,5,6\n7,8,9\n";
-        let input_file = "test_input.csv";
+        let input_file = "test/test_input.csv";
         let output_file = "test_output.csv";
-        fs::write(input_file, input_data).expect("Unable to write test input file");
 
-        // Define options
         let options = CsvOptions {
             input_file: Some(input_file.to_string()),
             output_file: Some(output_file.to_string()),
             input_columns: Some(vec!["col1".to_string(), "col3".to_string()]),
-            output_headers: Some(true),
             ..Default::default()
         };
 
-        // Run the process_csv function
         process_csv(&options).expect("process_csv failed");
 
-        // Check the output file
         let expected_output = "col1,col3\n1,3\n4,6\n7,9\n";
         let actual_output = fs::read_to_string(output_file).expect("Unable to read output file");
         assert_eq!(actual_output, expected_output);
 
-        // Cleanup test files
-        fs::remove_file(input_file).expect("Unable to delete test input file");
         fs::remove_file(output_file).expect("Unable to delete test output file");
     }
 
     #[test]
-    fn test_process_csv_without_columns_specified() {
-        // Create mock CSV input file
-        let input_data = r#"col1,col2,col3
-1,2,3
-4,5,6
-7,8,9
-"#;
-        let input_file = "test_input_no_columns.csv";
-        let output_file = "test_output_no_columns.csv";
-        fs::write(input_file, input_data).expect("Unable to write test input file");
+    fn test_process_csv_with_invalid_column() {
+        let input_file = "test/test_input.csv";
+        let output_file = "test_output.csv";
 
-        // Define options
+        let mut options = CsvOptions {
+            input_file: Some(input_file.to_string()),
+            output_file: Some(output_file.to_string()),
+            input_columns: Some(vec!["1-4".to_string()]),
+            ..Default::default()
+        };
+
+        assert_eq!(process_csv(&options).expect_err("").to_string(),
+                   "Invalid range. There are only 3 columns: 1-4");
+
+        options.input_columns = Some(vec!["4-1".to_string()]);
+        assert_eq!(process_csv(&options).expect_err("").to_string(),
+                   "Invalid range. Must be increasing: 4-1");
+
+        options.input_columns = Some(vec!["1-1".to_string()]);
+        assert_eq!(process_csv(&options).expect_err("").to_string(),
+                   "Invalid range. Must be increasing: 1-1");
+    }
+
+    #[test]
+    fn test_process_csv_without_columns_specified() {
+        let input_file = "test/test_input.csv";
+        let output_file = "test_output_no_columns.csv";
+        let input_data = fs::read_to_string(input_file).expect("Unable to read test input file");
+
         let options = CsvOptions {
             input_file: Some(input_file.to_string()),
             output_file: Some(output_file.to_string()),
@@ -247,16 +257,12 @@ mod tests {
             ..Default::default()
         };
 
-        // Run the process_csv function
         process_csv(&options).expect("process_csv failed");
 
-        // Check the output file
         let expected_output = input_data; // Since no columns are filtered, all columns are written
         let actual_output = fs::read_to_string(output_file).expect("Unable to read output file");
         assert_eq!(actual_output, expected_output);
 
-        // Cleanup test files
-        fs::remove_file(input_file).expect("Unable to delete test input file");
         fs::remove_file(output_file).expect("Unable to delete test output file");
     }
 
