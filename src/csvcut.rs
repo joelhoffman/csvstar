@@ -10,7 +10,10 @@ use std::fs::File;
 use std::io;
 use std::io::BufRead;
 use std::io::BufWriter;
-use std::ops::Range;
+use std::iter::Iterator;
+use std::ops::RangeInclusive;
+use std::string::ToString;
+use serial_test::serial;
 use crate::args::global_args;
 
 struct CsvCutOptions { input_columns: Option<Vec<String>> }
@@ -27,7 +30,7 @@ fn main() -> Result<(), String> {
 fn parse_args(args: Vec<String>) -> (CsvOptions, CsvCutOptions) {
     let executable_name = args[0].clone();
 
-    let mut command = global_args()
+    let command = global_args()
         .display_name(executable_name)
         .about("Selects columns from CSV files.")
         .arg(Arg::new("input_columns")
@@ -48,14 +51,11 @@ fn parse_args(args: Vec<String>) -> (CsvOptions, CsvCutOptions) {
     (args::build_options(matches), action)
 }
 
-fn parse_range(s: &str) -> Result<Range<usize>, ()> {
+fn parse_range(s: &str) -> Result<RangeInclusive<usize>, ()> {
     let (min, max) = s.split_once('-').ok_or(())?;
-    Ok(
-        Range {
-            start: min.parse::<usize>().map_err(|_| ())?,
-            end: 1 + max.parse::<usize>().map_err(|_| ())?,
-        }
-    )
+    Ok(RangeInclusive::new(
+            min.parse::<usize>().map_err(|_| ())?,
+            max.parse::<usize>().map_err(|_| ())?))
 }
 
 fn process_csv(options: &CsvOptions, cut_options: &CsvCutOptions) -> Result<(), Box<dyn Error>> {
@@ -64,34 +64,34 @@ fn process_csv(options: &CsvOptions, cut_options: &CsvCutOptions) -> Result<(), 
     let mut reader = csvutil::csv_reader(options, input);
 
     // Get the column headers
-    let headers = reader.headers()?.clone();
+    let first_row = reader.headers()?.clone();
 
     // Determine which columns to include
     let selected_indices: Vec<usize> = match &cut_options.input_columns {
         Some(cols) => {
             let mut idx_vec = vec![];
-            let n_headers = headers.len() as i32;
+            let n_headers = first_row.len() as i32;
             for col in cols {
                 if let Ok(numeric) = col.parse::<i32>() {
                     if numeric == 0 {
                         return Err(Box::from("Column 0 is invalid. Columns are 1-based."));
                     } else if (numeric < -n_headers) || (numeric > n_headers) {
-                        return Err(Box::from(format!("Column {} is invalid. There are {} columns.", numeric, headers.len())));
+                        return Err(Box::from(format!("Column {} is invalid. There are {} columns.", numeric, first_row.len())));
                     } else if numeric > 0 {
                         idx_vec.push((numeric -1) as usize);
                     } else {
                         idx_vec.push((n_headers + numeric) as usize);
                     }
                 } else if let Ok(range) = parse_range(col) {
-                    if range.start >= range.end {
-                        return Err(Box::from(format!("Invalid range. Must be increasing: {}-{}", range.start, range.end)));
+                    if range.start() >= range.end() {
+                        return Err(Box::from(format!("Invalid range. Must be increasing: {}-{}", range.start(), range.end())));
                     }
-                    if range.end > headers.len() {
-                        return Err(Box::from(format!("Invalid range. There are only {} columns: {}-{}", headers.len(), range.start, range.end)));
+                    if *range.end() > first_row.len() {
+                        return Err(Box::from(format!("Invalid range. There are only {} columns: {}-{}", first_row.len(), range.start(), range.end())));
                     }
                     idx_vec.extend(range.clone().map(|i| i - 1));
                 } else {
-                    idx_vec.push(headers
+                    idx_vec.push(first_row
                         .iter()
                         .position(|h| h == col)
                         .ok_or_else(|| format!("Column '{}' not found in input file", col))?)
@@ -99,7 +99,7 @@ fn process_csv(options: &CsvOptions, cut_options: &CsvCutOptions) -> Result<(), 
             }
             idx_vec
         },
-        None => (0..headers.len()).collect(), // If no columns are specified, include all columns
+        None => (0..first_row.len()).collect(), // If no columns are specified, include all columns
     };
 
     let csv_file_handle:Box<dyn io::Write>;
@@ -117,7 +117,14 @@ fn process_csv(options: &CsvOptions, cut_options: &CsvCutOptions) -> Result<(), 
         .from_writer(csv_file_handle);
 
     if output_has_headers {
-        csv_writer.write_record(selected_indices.iter().map(|&i| &headers[i]))?;
+        if options.input_has_headers.unwrap_or(true) {
+            csv_writer.write_record(selected_indices.iter().map(|&i| &first_row[i]))?;
+        } else {
+            let alphabet = ('a'..='z').map(String::from).collect::<Vec<_>>();
+            csv_writer.write_record(selected_indices.iter()
+                .map(|&i|
+                    alphabet[i % 26].repeat(1 + i/26) ))?;
+        }
     }
 
     for result in reader.records() {
@@ -132,6 +139,7 @@ fn process_csv(options: &CsvOptions, cut_options: &CsvCutOptions) -> Result<(), 
 }
 
 #[cfg(test)]
+#[serial] // tests must be serial because they write files with the same name
 mod tests {
     use super::*;
     use std::fs;
@@ -268,11 +276,40 @@ mod tests {
     }
 
     #[test]
+    fn test_process_csv_inventing_column_headers() {
+        let input_file = "test/100_empty_columns.csv";
+        let output_file = "test_output.csv";
+
+        let options = CsvOptions {
+            input_file: Some(input_file.to_string()),
+            output_file: Some(output_file.to_string()),
+            input_has_headers: Some(false),
+            output_headers: Some(true),
+            ..Default::default()
+        };
+
+        let action = CsvCutOptions {
+            input_columns: None,
+        };
+
+        process_csv(&options, &action).expect("process_csv failed");
+
+        let expected_output = "\
+a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p,q,r,s,t,u,v,w,x,y,z,aa,bb,cc,dd,ee,ff,gg,hh,ii,jj,kk,ll,mm,nn,oo,pp,qq,rr,ss,tt,uu,vv,ww,xx,yy,zz,aaa,bbb,ccc,ddd,eee,fff,ggg,hhh,iii,jjj,kkk,lll,mmm,nnn,ooo,ppp,qqq,rrr,sss,ttt,uuu,vvv,www,xxx,yyy,zzz,aaaa,bbbb,cccc,dddd,eeee,ffff,gggg,hhhh,iiii,jjjj,kkkk,llll,mmmm,nnnn,oooo,pppp,qqqq,rrrr,ssss,tttt,uuuu,vvvv,wwww
+,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,
+";
+        let actual_output = fs::read_to_string(output_file).expect("Unable to read output file");
+        assert_eq!(actual_output, expected_output);
+
+        fs::remove_file(output_file).expect("Unable to delete test output file");
+    }
+
+    #[test]
     fn test_build_args() {
         let args = vec!["CsvStar", "--columns", "col1,col2"]
             .iter().map(|s| s.to_string()).collect::<Vec<_>>();
 
-        let (options, action) = parse_args(args);
+        let (_, action) = parse_args(args);
 
         let columns: Vec<String> = action.input_columns.unwrap();
         assert_eq!(columns, vec!["col1", "col2"]);
