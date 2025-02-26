@@ -1,7 +1,7 @@
 
 # csv-star
 
-csv-star is a fast and efficient tool designed as a drop-in replacement for the popular Python `csvkit` library.
+csv-star is a faster tool designed as a drop-in replacement for the popular Python `csvkit` library.
 
 ## Installation
 
@@ -9,8 +9,8 @@ To compile and install csv-star, ensure you have Rust installed on your system. 
 
 ```bash
 git clone <repository_url>
-cd rust-csvkit
-cargo build --release
+cd csvkit
+cargo install --path .
 ```
 
-The binaries will be available in the `target/release/` directory. You can add it to your system's PATH for global usage.
+The binaries will be available wherever cargo puts them (e.g. `~/.cargo/bin` if using rustup.) You can add it to your PATH for future usage.
